@@ -2,9 +2,11 @@
 UC-X — Ask My Documents
 Built using RICE → agents.md → skills.md → CRAFT workflow.
 
-Two-stage rule-based implementation — no LLM, no API key, no external dependencies.
-Stage 1: deterministic pattern rules (covers all 7 README test questions)
-Stage 2: keyword fallback with synonym expansion + ratio-based cross-document guard
+ChromaDB semantic retrieval — no LLM, no API key.
+Replaces hand-crafted regex rules with vector similarity search.
+
+Dependencies:
+    pip install chromadb
 
 Run:
     python app.py
@@ -12,6 +14,8 @@ Interactive CLI — type a question, press Enter. Type 'quit' to exit.
 """
 import re
 import os
+
+import chromadb
 
 # ---------------------------------------------------------------------------
 # Policy file paths
@@ -29,103 +33,46 @@ REFUSAL_TEMPLATE = (
     "Please contact the relevant team for guidance."
 )
 
-# ---------------------------------------------------------------------------
-# Stage 1: deterministic pattern rules
-# Checked in order — first match wins.
-# (None, None) = always refuse (cross-document trap or genuinely out of scope)
-# ---------------------------------------------------------------------------
+# Cross-document blending guard: refuse if second-best doc appears in >= this
+# fraction of the top-N results (count-based, more robust than score ratio).
+COUNT_BLEND_THRESHOLD = 0.50
 
-PATTERN_RULES = [
-    # Cross-document trap — personal phone / device + work files/home (agents.md critical trap)
-    # Must come BEFORE any single-doc BYOD/personal-device pattern
-    (r"personal.{0,10}(phone|mobile|device).{0,40}(work (file|system|data|folder)|from home|access)",
-     None, None),
-    (r"(phone|mobile).{0,30}(work file|access.*from home|from home.*access)",
-     None, None),
+# Minimum similarity for the best-matching section (filters out-of-scope queries)
+MIN_SIMILARITY = 0.35
 
-    # HR: carry-forward annual leave (section 2.6)
-    (r"carry.{0,20}forward|carry.{0,20}unused|unused.{0,20}leave.{0,20}carry",
-     "policy_hr_leave.txt", "2.6"),
+# Number of nearest sections to retrieve per query
+N_RESULTS = 10
 
-    # HR: who approves LWP (section 5.2)
-    (r"(approv|who.{0,15}sign).{0,30}(leave without pay|lwp)"
-     r"|(leave without pay|lwp).{0,30}approv",
-     "policy_hr_leave.txt", "5.2"),
-    # Also catches "who approves leave without pay" where "leave without pay" spans the question
-    (r"who.{0,20}approv.{0,20}(leave|lwp)",
-     "policy_hr_leave.txt", "5.2"),
-
-    # IT: install software on corporate device (section 2.3)
-    (r"install.{0,40}(software|app|slack|teams|zoom|programme|program|laptop|computer|work)",
-     "policy_it_acceptable_use.txt", "2.3"),
-    (r"(slack|teams|zoom|software).{0,30}(install|laptop|work device)",
-     "policy_it_acceptable_use.txt", "2.3"),
-
-    # IT: personal device BYOD (section 3.1) — single-source only, no home/work-file combo
-    (r"personal (device|phone|mobile).{0,40}(access|use|connect)",
-     "policy_it_acceptable_use.txt", "3.1"),
-
-    # Finance: DA vs meal receipts same day (section 2.6)
-    (r"\b(da|daily allowance)\b.{0,40}(meal|receipt|same day)"
-     r"|(meal|same day).{0,40}\b(da|daily allowance)\b"
-     r"|claim.{0,20}(da|meal).{0,30}same",
-     "policy_finance_reimbursement.txt", "2.6"),
-
-    # Finance: home office equipment allowance (section 3.1)
-    (r"home.{0,15}office.{0,15}(equipment|allowance)"
-     r"|equipment.{0,15}allowance"
-     r"|wfh.{0,20}equipment"
-     r"|work.from.home.{0,20}(equipment|allowance)",
-     "policy_finance_reimbursement.txt", "3.1"),
+# Unambiguous keywords that force the ChromaDB search into a single document.
+# Used only when the term makes domain attribution certain (e.g. Slack = IT software).
+KEYWORD_FORCE_DOC = [
+    (r"\b(slack|teams|zoom)\b",              "policy_it_acceptable_use.txt"),
+    (r"\b(receipt[s]?|reimburse|expense[s]?)\b", "policy_finance_reimbursement.txt"),
 ]
-
-# ---------------------------------------------------------------------------
-# Stage 2: keyword fallback — synonym expansion + ratio threshold
-# ---------------------------------------------------------------------------
-
-QUERY_EXPANSIONS = {
-    "da":        ["daily", "allowance"],
-    "lwp":       ["leave", "pay"],
-    "lop":       ["loss", "pay"],
-    "wfh":       ["home", "work"],
-    "slack":     ["software", "install"],
-    "teams":     ["software", "install"],
-    "zoom":      ["software", "install"],
-    "laptop":    ["device", "corporate"],
-    "laptops":   ["device", "corporate"],
-    "phone":     ["personal", "device"],
-    "mobile":    ["personal", "device"],
-    "approves":  ["approval"],
-    "approved":  ["approval"],
-    "approving": ["approval"],
-}
-
-STOPWORDS = {
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "i", "my", "me", "we", "our",
-    "you", "your", "it", "its", "this", "that", "of", "in", "on", "at",
-    "to", "for", "with", "from", "by", "and", "or", "not", "no", "any",
-    "all", "what", "when", "who", "how", "if", "as", "use", "used",
-    "get", "want", "need", "know", "tell", "about",
-}
-
-# Cross-document blending threshold: if second-best doc scores >= this fraction
-# of top doc, the answer is ambiguous → refuse
-BLEND_THRESHOLD = 0.60
 
 
 # ---------------------------------------------------------------------------
 # Skill: retrieve_documents
 # ---------------------------------------------------------------------------
 
-def retrieve_documents() -> dict:
+def retrieve_documents() -> chromadb.Collection:
     """
-    Load all 3 CMC policy files and index by (document_name, section_number).
+    Parse all 3 CMC policy files into sections and load them into an
+    in-memory ChromaDB collection using the default embedding function.
 
-    Output: dict mapping (doc_name, section_num) → section text
+    Output: ChromaDB Collection indexed by (doc_name, section_num)
     """
-    index = {}
+    client = chromadb.EphemeralClient()
+    collection = client.create_collection("policy_docs")
+
+    section_pattern = re.compile(
+        r"(\d+\.\d+)\s+(.*?)(?=\n\s*\d+\.\d+\s|\n[═]+|\Z)",
+        re.DOTALL,
+    )
+
+    documents, metadatas, ids = [], [], []
+    doc_counts = {}
+
     for path in POLICY_FILES:
         doc_name = os.path.basename(path)
         try:
@@ -137,101 +84,114 @@ def retrieve_documents() -> dict:
                 "All 3 policy files are required. Do not proceed with partial data."
             ) from e
 
-        pattern = re.compile(
-            r"(\d+\.\d+)\s+(.*?)(?=\n\s*\d+\.\d+\s|\n[═]+|\Z)",
-            re.DOTALL,
-        )
-        for match in pattern.finditer(raw):
+        count = 0
+        seen_ids: dict[str, int] = {}
+        for match in section_pattern.finditer(raw):
             section_num = match.group(1).strip()
             text = re.sub(r"\s+", " ", match.group(2)).strip()
-            index[(doc_name, section_num)] = text
+            base_id = f"{doc_name}__{section_num}"
+            if base_id in seen_ids:
+                seen_ids[base_id] += 1
+                uid = f"{base_id}__dup{seen_ids[base_id]}"
+            else:
+                seen_ids[base_id] = 0
+                uid = base_id
+            documents.append(text)
+            metadatas.append({"doc_name": doc_name, "section_num": section_num})
+            ids.append(uid)
+            count += 1
 
-    return index
+        doc_counts[doc_name] = count
+
+    collection.add(documents=documents, metadatas=metadatas, ids=ids)
+
+    for doc, count in doc_counts.items():
+        print(f"  Loaded {doc} ({count} sections)")
+
+    return collection
 
 
 # ---------------------------------------------------------------------------
-# Skill: answer_question (two-stage)
+# Skill: answer_question
 # ---------------------------------------------------------------------------
 
-def answer_question(question: str, index: dict) -> str:
+def answer_question(question: str, collection: chromadb.Collection) -> str:
     """
-    Return a single-source answer with citation, or the exact refusal template.
-
-    Stage 1: Check PATTERN_RULES — deterministic, handles all 7 README test questions.
-    Stage 2: Keyword fallback with synonym expansion and ratio-based cross-doc guard.
+    Query ChromaDB for the most relevant policy section and return a cited
+    answer, or the exact refusal template if:
+      - no section clears the minimum similarity threshold, OR
+      - a second document claims >= 50% of the top-N results (cross-doc blending risk).
 
     Enforcement rules applied:
-    1. Never combine claims from two documents — cross-doc ratio guard + trap patterns
+    1. Never combine claims from two documents — count-based cross-doc guard
     2. Refusal template is a constant string — no hedging possible
     3. Every answer includes (Source: doc, section X.Y)
     4. Not found in any document → exact refusal template
     """
-    q_lower = question.lower().strip()
+    q_lower = question.lower()
 
-    # --- Stage 1: pattern rules ---
-    for pattern, doc_name, section_num in PATTERN_RULES:
+    # Keyword pre-filter: if the question contains an unambiguous domain term,
+    # restrict ChromaDB search to that document only.
+    force_doc = None
+    for pattern, doc in KEYWORD_FORCE_DOC:
         if re.search(pattern, q_lower):
-            if doc_name is None:
-                return REFUSAL_TEMPLATE
-            section_text = index.get((doc_name, section_num), "")
-            if section_text:
-                return (
-                    f"{section_text}\n\n"
-                    f"(Source: {doc_name}, section {section_num})"
-                )
+            force_doc = doc
+            break
 
-    # --- Stage 2: keyword fallback ---
-    words = set(re.findall(r"[a-z]+", q_lower)) - STOPWORDS
+    query_kwargs = dict(
+        query_texts=[question],
+        n_results=min(N_RESULTS, collection.count()),
+        include=["documents", "metadatas", "distances"],
+    )
+    if force_doc:
+        query_kwargs["where"] = {"doc_name": force_doc}
 
-    # Synonym expansion
-    for alias, expansions in QUERY_EXPANSIONS.items():
-        if alias in words:
-            words.update(expansions)
+    results = collection.query(**query_kwargs)
 
-    if not words:
+    if not results["ids"][0]:
         return REFUSAL_TEMPLATE
 
-    # Score sections
-    scores = {}
-    for (doc_name, section_num), text in index.items():
-        section_words = set(re.findall(r"[a-z]+", text.lower())) - STOPWORDS
-        score = sum(
-            1 for qw in words
-            if qw in section_words
-            or any(
-                len(qw) >= 5 and len(sw) >= 5 and qw[:5] == sw[:5]
-                for sw in section_words
-            )
-        )
-        if score > 0:
-            scores[(doc_name, section_num)] = score
+    # Build per-document stats over the top-N results:
+    #   doc_best:  doc_name → (best_similarity, section_num, text)
+    #   doc_count: doc_name → number of sections in top-N
+    doc_best: dict[str, tuple[float, str, str]] = {}
+    doc_count: dict[str, int] = {}
+    for dist, meta, text in zip(
+        results["distances"][0],
+        results["metadatas"][0],
+        results["documents"][0],
+    ):
+        sim = 1.0 / (1.0 + dist)
+        doc_name = meta["doc_name"]
+        section_num = meta["section_num"]
+        doc_count[doc_name] = doc_count.get(doc_name, 0) + 1
+        if doc_name not in doc_best or sim > doc_best[doc_name][0]:
+            doc_best[doc_name] = (sim, section_num, text)
 
-    if not scores:
+    # Rank by count descending, then by best similarity as tiebreaker
+    ranked = sorted(
+        doc_best.keys(),
+        key=lambda d: (doc_count[d], doc_best[d][0]),
+        reverse=True,
+    )
+
+    top_doc = ranked[0]
+    top_sim = doc_best[top_doc][0]
+
+    # Minimum similarity guard — question is genuinely out of scope
+    if top_sim < MIN_SIMILARITY:
         return REFUSAL_TEMPLATE
 
-    # Best score per document
-    doc_best = {}
-    for (doc_name, section_num), score in scores.items():
-        if doc_name not in doc_best or score > doc_best[doc_name][0]:
-            doc_best[doc_name] = (score, section_num)
-
-    ranked = sorted(doc_best.items(), key=lambda x: x[1][0], reverse=True)
-
-    # Cross-document ratio guard (agents.md enforcement rule 1)
+    # Count-based cross-document guard (agents.md enforcement rule 1):
+    # refuse if the second document holds ≥ 50% as many top-N hits as the first
     if len(ranked) > 1:
-        top_score    = ranked[0][1][0]
-        second_score = ranked[1][1][0]
-        if second_score >= top_score * BLEND_THRESHOLD:
+        top_cnt    = doc_count[ranked[0]]
+        second_cnt = doc_count[ranked[1]]
+        if second_cnt >= top_cnt * COUNT_BLEND_THRESHOLD:
             return REFUSAL_TEMPLATE
 
-    best_doc         = ranked[0][0]
-    best_section_num = ranked[0][1][1]
-    section_text     = index[(best_doc, best_section_num)]
-
-    return (
-        f"{section_text}\n\n"
-        f"(Source: {best_doc}, section {best_section_num})"
-    )
+    best_sim, best_section, best_text = doc_best[top_doc]
+    return f"{best_text}\n\n(Source: {top_doc}, section {best_section})"
 
 
 # ---------------------------------------------------------------------------
@@ -239,19 +199,14 @@ def answer_question(question: str, index: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
-    print("Loading policy documents...")
+    print("Loading policy documents into ChromaDB...")
     try:
-        index = retrieve_documents()
+        collection = retrieve_documents()
     except RuntimeError as e:
         print(f"ERROR: {e}")
         raise SystemExit(1)
 
-    doc_counts = {}
-    for (doc, _) in index:
-        doc_counts[doc] = doc_counts.get(doc, 0) + 1
-    for doc, count in doc_counts.items():
-        print(f"  Loaded {doc} ({count} sections)")
-
+    print(f"\n  Total sections indexed: {collection.count()}")
     print("\nReady. Type a question and press Enter. Type 'quit' to exit.\n")
     print("=" * 60)
 
@@ -268,7 +223,7 @@ def main():
             print("Exiting.")
             break
 
-        answer = answer_question(question, index)
+        answer = answer_question(question, collection)
         print(f"\nAnswer:\n{answer}")
         print("-" * 60)
 
